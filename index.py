@@ -10,14 +10,14 @@ import numpy as np
 from openai.embeddings_utils import cosine_similarity, get_embedding
 import tiktoken
 
-# Set the maximum column width to None to avoid truncation
+# set the maximum column width to None to avoid truncation
 pd.set_option('display.max_colwidth', None)
 
-# # embedding model parameters
+# embedding model parameters
 EMBEDDING_MODEL = "gpt-3.5-turbo"
 EMBEDDING_ENCODING = "cl100k_base"  # this the encoding for gpt-3.5-turbo
 MAX_TOKENS_SUMMARY = 4000  # the maximum for gpt-3.5-turbo is 4097
-MAX_TOKENS = 16000 # the maximum for gpt-3.5-turbo is 4097
+MAX_TOKENS = 16000  # the maximum for gpt-3.5-turbo-16k is 16000+
 
 app = Flask(__name__)
 
@@ -99,20 +99,21 @@ def search_products(df, search):
     # calculate the cosine similarity between the row embeddings and the search query embedding and sort
     df["similarity"] = df.embedding.apply(lambda x: cosine_similarity(x, row_embedding))
     new = df.sort_values("similarity", ascending=False)
-    # only return the rows with a higher than 0.7
-    highScores = new[new['similarity'] >= 0.7]
+    # only return the rows with a higher than 0.75
+    highScores = new[new['similarity'] >= 0.75]
     return highScores
 
 
-# function to send back a message
+# function to handle mentions by searching products related to the mentioned text
 def handleMentions(channel, text, messagesOb):
     try:
         # print the text from Slack
         print(f'Input: {text}')
-        # search through our dataset
+        # search the products in the dataset related to the input text
         results = search_products(df, text)
+        # get the top 5 unique product links from the results
         top_results = list(results['link'].unique()[:5])
-        # get relevant product data from product data
+        # locate the relevant product data from the product dataframe
         product_df.loc[top_results]
 
     except Exception as e:
@@ -121,16 +122,18 @@ def handleMentions(channel, text, messagesOb):
 
     # set up the prompt with the matched results from the dataset
     try:
+        # Send message to user if prompt will take too long
         if len(top_results) > 2:
             slack_client.chat_postMessage(channel=channel, text='Scanning Database for relevant product information ...')
         print('building prompt ...')
         print(top_results)
+        # build the prompt using the product data and top results and append to messages
         prompt = build_prompt(product_df, top_results, text, messagesOb)
         messagesOb.append({"role": "user", "content": prompt})
     except Exception as e:
         print("Error building prompt:", e)
 
-    # reduce the size of the context if too much for gpt to handle
+    # trim the messages to fit within the max token limit
     try:
         print('checking if we need to make the message shorter ...')
         messagesOb = trim_messages(messagesOb, MAX_TOKENS)
@@ -141,17 +144,20 @@ def handleMentions(channel, text, messagesOb):
     # make the openAI call
     print('waiting for response ...')
     try:
+        # check that there are messages to process
         assert len(messagesOb) > 0, 'no messages passed in'
 
+        # create a chat completion request to the specified gpt model
+        # use the 16k model so more conversation context can be included
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo-16k",
             messages=messagesOb,
         )
-        # print response - see token count
+        # print the token usage for the response
         print(f"Token usage: {response['usage']['total_tokens']}")
         # post message back to slack with the response
         slack_client.chat_postMessage(channel=channel, text=response.choices[0].message.content)
-        # append message to the messageOb object
+        # append the response message to the messages object
         messagesOb.append(response.choices[0].message)
 
     except Exception as e:
@@ -160,19 +166,25 @@ def handleMentions(channel, text, messagesOb):
         slack_client.chat_postMessage(channel=channel, text=f'Reloading context')
 
 
+# function to build a gpt prompt based on product information, top results, user input, and previous messages
 def build_prompt(product_df, top_results, user_input, messages):
+    # return user input if no relevant products found
     if product_df.loc[top_results].empty:
         return user_input
 
     relevant_info = []
+    # iterate through the top results and collect relevant information
     for relevant_result in top_results:
+        # create a metadata string containing key-value pairs of product attributes
         product = product_df.loc[relevant_result]['product_name']
         metadata_str = product_df.loc[[relevant_result]].apply(
             lambda row: '\n'.join([f'{k}: {v}' for k, v in row.items()]), 
             axis=1
         ).to_string(header=False, index=False).strip()
+        # append the relevant info obtained using a specific method
         relevant_info.append(get_llm_relevant_info(metadata_str, user_input, messages, product))
 
+    # build the prompt by combining relevant information and specific instructions
     prompt = (
         "Look through this database information to answer the question: " +
         '; '.join(relevant_info).replace("+", " ").strip() +
@@ -186,84 +198,96 @@ def build_prompt(product_df, top_results, user_input, messages):
         should have access to database information including pricing \
         for different products (and different sizes of the same \
         product) as well as many different customization options \
-        for each product in the \"customization\" section of the \
-        information passed to you above, where for mattresses the \
-        key is size_firmness with the value being price, and for \
-        furniture and bedding products, the key is type_size_material \
-        with the value again being the price for that specific \
-        combination. If the \
-        user wants to look at different products you can recommend \
-        altering the query to be more specific. \
+        for each product. If there are multiple products \
+        that fit the user's question, use a bulleted list \
+        in your response. If the user wants to look at different \
+        products you can recommend altering the query to be more specific. \
         The question is: " + user_input
     )
 
     return prompt
 
 
+# function to obtain relevant information from metadata using a language model
 def get_llm_relevant_info(metadata_str, user_input, messages, product):
-    # try:
-    messages.append({'role': 'user', 'content': user_input})
-    messagesOb1 = [
-            {"role": "system",
-            "content":
-            f"You are a helpful assistant to a llm. Your task is to sort through \
-            metadata and pull out only the parts that are relevant to the \
-            product: {product} and the user query {user_input}.  \
-            You will have access to the conversation between \
-            the user (role:user) and the llm (role:assistant) with the llm's \
-            context being in the first message (role:system). The metadata \
-            will have information about product name, product type, \
-            ratings, and customaizations. If the product type is mattress, the \
-            customization will be in the form size_firmness: cost. If the product type \
-            is furniture or bedding, the customization will be in the form \
-            type_size_material: cost. Any \"+\" character can be rplaced with \
-            a space, so plush+soft would just be \"plush soft\". \
-            You are only allowed to respond with \
-            information contained within the metadata. If there is no relevant \
-            metadata then just say \"None\". Keep messages as concise \
-            as possible, in approximately 100 words. The output should be \
-            in the form of a summmary. The output should not be a bulleted list."
-            },
-            {"role": "user",
-            "content":
-            f"I need you to help me find relevant information from my metadata. \
-            Here is my metadata: {metadata_str}. I want information about product {product}\
-            that can be used to help answer the last question in this conversation: {messages} \
-            Only add info that is in the metadata and please do it as concisely as possible, in \
-            no more than 150 words. The output should be in the form of a summary. The output should \
-            not be a bulleted list \
-            If there is no relevant information, just say \"None\". "
-            }
-    ]
+    try:
+        # append user input to messages
+        messages.append({'role': 'user', 'content': user_input})
+        # construct the conversation for the openai call
+        messagesOb1 = [
+                {"role": "system",
+                 "content": f"You are a helpful assistant to a llm. \
+                 Your task is to sort through metadata and pull \
+                 out only the parts that are relevant to \
+                 the product: {product} and the user query {user_input}.  \
+                 You will have access to the conversation between \
+                 the user (role:user) and the llm (role:assistant) with the \
+                 llm's context being in the first message (role:system). The \
+                 metadata will have information about product name, product \
+                 type, ratings, and customaizations. If the product type is \
+                 mattress, the customization will be in the \
+                 form size_firmness: cost. If the product type is furniture \
+                 or bedding, the customization will be in the form \
+                 type_size_material: cost. You are only allowed to respond \
+                 with information contained within the metadata. If there \
+                 is no relevant metadata then just say \"None\". \
+                 Keep messages as concise as possible, in approximately 100 \
+                 words. The output should be in the form of a summmary. \
+                 The output should not be a bulleted list."
+                 },
+                {"role": "user",
+                 "content": f"I need you to help me find relevant information \
+                 from my metadata. Here is my metadata: {metadata_str}. \
+                 I want information about product {product} \
+                 that can be used to help answer the last question in this\
+                 conversation: {messages} \
+                 Only add info that is in the metadata and please do it as \
+                 concisely as possible, in no more than 150 words. \
+                 The output should be in the form of a summary. \
+                 The output should not be a bulleted list. \
+                 If there is no relevant information, just say \"None\". "
+                 }
+        ]
 
-    encoding = tiktoken.get_encoding(EMBEDDING_ENCODING)
-    num_tokens_used = len(encoding.encode('; '.join(f'{k}:{v}' for message in messagesOb1 for k, v in message.items())))
-    messages = trim_messages(messages, max_tokens=MAX_TOKENS_SUMMARY-num_tokens_used)
+        # token counting
+        encoding = tiktoken.get_encoding(EMBEDDING_ENCODING)
+        num_tokens_used = len(encoding.encode('; '.join(f'{k}:{v}' for message in messagesOb1 for k, v in message.items())))
+        # trim messages to fit within the max token limit
+        messages = trim_messages(messages, max_tokens=MAX_TOKENS_SUMMARY-num_tokens_used)
 
-    messagesOb1 += [
-            {"role": "user",
-            "content":
-            f"To help you find the relevant metadata, here is \
-            the conversation so far: {messages}"
-            }
-    ]
+        # append the conversation to the messages
+        messagesOb1 += [
+                {"role": "user",
+                "content":
+                f"To help you find the relevant metadata, here is \
+                the conversation so far: {messages}"
+                }
+        ]
 
-    response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=messagesOb1,
-        )
+        # create a chat completion request to openai
+        response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messagesOb1,
+            )
 
-    response_text = response.choices[0].message.content
-    return response_text
+        response_text = response.choices[0].message.content
+        return response_text
 
-    # except Exception as e:
-    #     print("An error occurred while trying to parse metadata:", e)
+    except Exception as e:
+        print("An error occurred while trying to parse metadata:", e)
+
+    # if there is an error, just return the metadata itself
     return metadata_str
 
+
+# function to trim messages to fit within the max token limit
 def trim_messages(messages, max_tokens=MAX_TOKENS):
+    # get the encoding for token counting
     encoding = tiktoken.get_encoding(EMBEDDING_ENCODING)
+    # loop until the encoded messages fit within the max token limit
     while len(encoding.encode(''.join(f'{k}:{v}' for message in messages for k, v in message.items()))) > max_tokens and len(messagesOb) > 1:
         print(f'shortening message...')
+        # remove the second message in the list
         messages.pop(1)
 
     return messages
